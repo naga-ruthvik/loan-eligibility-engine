@@ -1,0 +1,5 @@
+SQLAlchemy==2.1.5
+psycopg[binary]==3.2.10
+python-dotenv==1.0.1
+alembic==1.16.5
+boto3==1.43.116

@@ -1,0 +1,16 @@
+alembic==1.16.5
+boto3==1.43.116
+botocore==1.43.116
+jmespath==1.1.0
+Mako==1.4.3
+MarkupSafe==3.0.4
+psycopg==3.2.10
+psycopg-binary==3.2.10
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+s3transfer==0.19.3
+six==1.17.0
+SQLAlchemy==2.1.5
+typing_extensions==4.16.0
+tzdata==2026.5
+urllib3==2.8.0

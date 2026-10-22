@@ -9,9 +9,36 @@ provider:
   name: aws
   runtime: python3.14
   architecture: arm64
+  region: ap-southeast-2
+  # HTTP API Gateway supports a maximum of 30 seconds. Use 29 seconds so
+  # the HTTP functions do not sit exactly on that limit.
+  timeout: 29
+  httpApi:
+    cors: true
+  environment:
+    DATABASE_URL: ${env:DATABASE_URL, ''}
+    UPLOAD_BUCKET:
+      Ref: UploadBucket
+    INGESTION_QUEUE_URL:
+      Ref: IngestionQueue
+    MATCHING_QUEUE_URL:
+      Ref: MatchingQueue
+    N8N_WEBHOOK_URL: ${env:N8N_WEBHOOK_URL, ''}
+    PRESIGNED_URL_EXPIRES_SECONDS: ${env:PRESIGNED_URL_EXPIRES_SECONDS, '900'}
+    INGESTION_BATCH_ROWS: ${env:INGESTION_BATCH_ROWS, '1000'}
+    N8N_WEBHOOK_TIMEOUT_SECONDS: ${env:N8N_WEBHOOK_TIMEOUT_SECONDS, '10'}
+    N8N_WEBHOOK_LOCK_SECONDS: ${env:N8N_WEBHOOK_LOCK_SECONDS, '600'}
   # Uncomment to easily set up a custom domain. Read the docs for more details:
   # https://www.serverless.com/framework/docs/providers/aws/guide/domains
   # domain: api.example.com
+
+package:
+  patterns:
+    - '!.env'
+    - '!venv/**'
+
+custom:
+  pythonRequirements: {}
 
 functions:
   hello:
@@ -20,3 +47,252 @@ functions:
       - httpApi:
           path: /
           method: get
+  createUploadUrl:
+    handler: pipeline.upload.create_upload_url
+    role:
+      Fn::GetAtt:
+        - UploadLambdaRole
+        - Arn
+    events:
+      - httpApi:
+          path: /ingestions/upload-url
+          method: post
+  ingestUsers:
+    handler: pipeline.ingestion.handle_ingestion
+    timeout: 900
+    role:
+      Fn::GetAtt:
+        - IngestionLambdaRole
+        - Arn
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - IngestionQueue
+              - Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+  triggerMatching:
+    handler: pipeline.matching.handle_matching
+    timeout: 30
+    role:
+      Fn::GetAtt:
+        - MatchingLambdaRole
+        - Arn
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - MatchingQueue
+              - Arn
+          batchSize: 1
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn:
+        - IngestionQueuePolicy
+      Properties:
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        VersioningConfiguration:
+          Status: Enabled
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods:
+                - PUT
+                - GET
+                - HEAD
+              AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+        LifecycleConfiguration:
+          Rules:
+            - Id: AbortIncompleteMultipartUploads
+              Status: Enabled
+              AbortIncompleteMultipartUpload:
+                DaysAfterInitiation: 7
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue:
+                Fn::GetAtt:
+                  - IngestionQueue
+                  - Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: prefix
+                      Value: incoming/
+                    - Name: suffix
+                      Value: .csv
+    IngestionDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+    IngestionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 5400
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - IngestionDLQ
+              - Arn
+          maxReceiveCount: 5
+    IngestionQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: IngestionQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Sid: AllowS3ToSendIngestionEvents
+              Effect: Allow
+              Principal:
+                Service: s3.amazonaws.com
+              Action: sqs:SendMessage
+              Resource:
+                Fn::GetAtt:
+                  - IngestionQueue
+                  - Arn
+              Condition:
+                StringEquals:
+                  aws:SourceAccount:
+                    Ref: AWS::AccountId
+    MatchingDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+    MatchingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        VisibilityTimeout: 180
+        SqsManagedSseEnabled: true
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - MatchingDLQ
+              - Arn
+          maxReceiveCount: 5
+    UploadLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: CreatePresignedUpload
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource:
+                    Fn::Sub: arn:aws:s3:::${UploadBucket}/*
+    IngestionLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: ProcessUploadedCsv
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectVersion
+                  Resource:
+                    Fn::Sub: arn:aws:s3:::${UploadBucket}/*
+                - Effect: Allow
+                  Action:
+                    - sqs:ReceiveMessage
+                    - sqs:DeleteMessage
+                    - sqs:GetQueueAttributes
+                  Resource:
+                    Fn::GetAtt:
+                      - IngestionQueue
+                      - Arn
+                - Effect: Allow
+                  Action:
+                    - sqs:SendMessage
+                  Resource:
+                    - Fn::GetAtt:
+                        - IngestionQueue
+                        - Arn
+                    - Fn::GetAtt:
+                        - MatchingQueue
+                        - Arn
+    MatchingLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: ProcessMatchingTriggers
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - sqs:ReceiveMessage
+                    - sqs:DeleteMessage
+                    - sqs:GetQueueAttributes
+                  Resource:
+                    Fn::GetAtt:
+                      - MatchingQueue
+                      - Arn
+
+  Outputs:
+    UploadBucketName:
+      Value:
+        Ref: UploadBucket
+    IngestionQueueUrl:
+      Value:
+        Ref: IngestionQueue
+    MatchingQueueUrl:
+      Value:
+        Ref: MatchingQueue
