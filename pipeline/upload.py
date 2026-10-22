@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from uuid import uuid4
 
 import boto3
+from botocore.config import Config
 
 from database.models import IngestionJob
 from database.session import session_scope
@@ -13,7 +15,17 @@ from database.session import session_scope
 from .config import get_pipeline_settings
 
 
-s3_client = boto3.client("s3")
+# Generate a region-specific SigV4 URL. Without this, S3 can return a 307
+# redirect from the global endpoint to ap-southeast-2. Browsers often do not
+# complete redirected cross-origin PUT requests, so the upload appears stuck.
+s3 = boto3.client(
+    "s3",
+    region_name=os.getenv("AWS_REGION", "ap-southeast-2"),
+    config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "virtual"},
+    ),
+)
 
 
 def create_upload_url(event: dict, context: object) -> dict:
@@ -24,7 +36,7 @@ def create_upload_url(event: dict, context: object) -> dict:
     job_id = uuid4()
     object_key = f"incoming/{job_id}/users.csv"
 
-    upload_url = s3_client.generate_presigned_url(
+    upload_url = s3.generate_presigned_url(
         ClientMethod="put_object",
         Params={
             "Bucket": settings.upload_bucket,

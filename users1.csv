@@ -1,0 +1,10 @@
+user_id,name,email,monthly_income,credit_score,employment_status,age
+b35de23e-755f-4c6a-81d8-f7dd99ce53ef,Dhruv Iyengar,kondenagaruthik@gmail.com,131000,725,Self-Employed,37
+77fce4da-b901-4b27-b1bb-01989567b98b,Tara Khan,thescientist.edit@gmail.com,765,Self-Employed,36
+2e29429d-17ba-4170-a9bc-ada98b018c58,Naga Ruthvik,kondenagaruthik@gmail.com,62000,705,Self-Employed,36
+b0c5eb7b-3826-4f6c-ae09-8c8523bdf0a7,Shaurya Iyer,shaurya.iyer@example.com,31000,705,Self-Employed,43
+363f26a0-3c05-49f1-a293-fc17bffca6e9,Ishaan Trivedi,ishaan.trivedi@example.com,35000,800,Salaried,34
+da445e46-d7ac-4ace-be2a-613314159f7e,Isha Chauhan,isha.chauhan@example.com,96000,755,Business,31
+48f2d242-2c3e-4929-a8df-6c9a484ae5b0,Tara Kapoor,tara.kapoor@example.com,33000,720,Salaried,41
+b3064a95-4821-4331-b429-287ff4b74373,Dhruv Roy,dhruv.roy@example.com,58000,770,Salaried,32
+d3b425f2-5dc9-48c3-8e12-c953a61cf1e0,Aditya Soni,aditya.soni@example.com,36000,745,Self-Employed,44

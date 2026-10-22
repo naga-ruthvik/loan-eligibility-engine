@@ -7,8 +7,9 @@ service: loan-eligibility-engine
 
 provider:
   name: aws
-  runtime: python3.14
-  architecture: arm64
+  # The dependency layer is built for Python 3.12 on Linux x86_64.
+  runtime: python3.12
+  architecture: x86_64
   region: ap-southeast-2
   # HTTP API Gateway supports a maximum of 30 seconds. Use 29 seconds so
   # the HTTP functions do not sit exactly on that limit.
@@ -24,6 +25,7 @@ provider:
     MATCHING_QUEUE_URL:
       Ref: MatchingQueue
     N8N_WEBHOOK_URL: ${env:N8N_WEBHOOK_URL, ''}
+    N8N_WORKFLOW_C_WEBHOOK_URL: ${env:N8N_WORKFLOW_C_WEBHOOK_URL, ''}
     PRESIGNED_URL_EXPIRES_SECONDS: ${env:PRESIGNED_URL_EXPIRES_SECONDS, '900'}
     INGESTION_BATCH_ROWS: ${env:INGESTION_BATCH_ROWS, '1000'}
     N8N_WEBHOOK_TIMEOUT_SECONDS: ${env:N8N_WEBHOOK_TIMEOUT_SECONDS, '10'}
@@ -37,18 +39,11 @@ package:
     - '!.env'
     - '!venv/**'
 
-custom:
-  pythonRequirements: {}
-
 functions:
-  hello:
-    handler: handler.hello
-    events:
-      - httpApi:
-          path: /
-          method: get
   createUploadUrl:
     handler: pipeline.upload.create_upload_url
+    layers:
+      - arn:aws:lambda:ap-southeast-2:485378272007:layer:clickpe-dependencies:1
     role:
       Fn::GetAtt:
         - UploadLambdaRole
@@ -60,6 +55,8 @@ functions:
   ingestUsers:
     handler: pipeline.ingestion.handle_ingestion
     timeout: 900
+    layers:
+      - arn:aws:lambda:ap-southeast-2:485378272007:layer:clickpe-dependencies:1
     role:
       Fn::GetAtt:
         - IngestionLambdaRole
@@ -75,6 +72,8 @@ functions:
   triggerMatching:
     handler: pipeline.matching.handle_matching
     timeout: 30
+    layers:
+      - arn:aws:lambda:ap-southeast-2:485378272007:layer:clickpe-dependencies:1
     role:
       Fn::GetAtt:
         - MatchingLambdaRole

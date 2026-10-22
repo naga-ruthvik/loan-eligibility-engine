@@ -78,9 +78,28 @@ def process_delivery(delivery_id: UUID) -> None:
         _fail_delivery(delivery_id, "N8N_WEBHOOK_URL is not configured", None)
         raise RuntimeError("N8N_WEBHOOK_URL is not configured")
 
-    status_code = _post_to_n8n(
+    # Workflow B must be configured to respond after its last node finishes.
+    # Only then do we start Workflow C for email notifications.
+    status_code = _post_webhook(
         delivery_id,
         settings.n8n_webhook_url,
+        payload,
+        settings.webhook_timeout_seconds,
+    )
+
+    if not settings.workflow_c_webhook_url:
+        _fail_delivery(
+            delivery_id,
+            "N8N_WORKFLOW_C_WEBHOOK_URL is not configured",
+            None,
+        )
+        raise RuntimeError("N8N_WORKFLOW_C_WEBHOOK_URL is not configured")
+
+    # Workflow C receives the same small payload, only after Workflow B has
+    # returned a successful response.
+    status_code = _post_webhook(
+        delivery_id,
+        settings.workflow_c_webhook_url,
         payload,
         settings.webhook_timeout_seconds,
     )
@@ -100,7 +119,7 @@ def process_delivery(delivery_id: UUID) -> None:
             delivery.last_http_status = status_code
 
 
-def _post_to_n8n(
+def _post_webhook(
     delivery_id: UUID, url: str, payload: dict[str, Any], timeout: int
 ) -> int:
     """POST the small completion payload and return n8n's HTTP status."""

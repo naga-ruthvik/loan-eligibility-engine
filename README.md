@@ -17,6 +17,10 @@ This template demonstrates how to make a simple HTTP API with Python running on 
 The project now includes a PostgreSQL-ready SQLAlchemy database layer. See
 the [Database layer](#database-layer) section for configuration and usage.
 
+Lambda uses the shared `clickpe-dependencies` layer for Python dependencies.
+The functions run on Python 3.12 and x86_64 so the packaged PostgreSQL driver
+matches the Lambda runtime.
+
 ## Usage
 
 ### CSV upload interface
@@ -37,6 +41,25 @@ The frontend is already configured to use the deployed upload API.
 
 The interface displays the resulting `job_id` after S3 accepts the upload.
 The ingestion pipeline then processes the file in the background.
+
+After the matching workflow completes, Workflow B should call the Workflow C
+n8n webhook with the same `job_id`:
+
+```text
+POST https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
+Content-Type: application/json
+```
+
+```json
+{
+  "job_id": "..."
+}
+```
+
+The deployed matching Lambda now performs this handoff itself: it calls
+`N8N_WEBHOOK_URL` first, waits for a successful response, and then calls
+`N8N_WORKFLOW_C_WEBHOOK_URL` with the same body. Configure Workflow B to return
+its webhook response only after its last matching node has finished.
 
 ### Deployment
 
