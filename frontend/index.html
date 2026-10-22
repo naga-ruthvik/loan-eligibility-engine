@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Upload users CSV</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="upload-card">
+      <p class="eyebrow">Loan eligibility engine</p>
+      <h1>Upload users CSV</h1>
+      <p class="intro">
+        Choose a CSV file. The browser will request a temporary upload URL and
+        send the file directly to S3.
+      </p>
+
+      <form id="upload-form">
+        <label for="csv-file">CSV file</label>
+        <input
+          id="csv-file"
+          name="csv-file"
+          type="file"
+          accept=".csv,text/csv"
+          required
+        />
+
+        <button id="upload-button" type="submit">Upload CSV</button>
+      </form>
+
+      <section id="status" class="status" aria-live="polite" hidden></section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>
