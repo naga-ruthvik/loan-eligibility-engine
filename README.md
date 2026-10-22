@@ -1,208 +1,644 @@
-<!--
-title: 'AWS Simple HTTP Endpoint example in Python'
-description: 'This template demonstrates how to make a simple HTTP API with Python running on AWS Lambda and API Gateway using the Serverless Framework.'
-layout: Doc
-framework: v4
-platform: AWS
-language: python
-authorLink: 'https://github.com/serverless'
-authorName: 'Serverless, Inc.'
-authorAvatar: 'https://avatars1.githubusercontent.com/u/13742415?s=200&v=4'
--->
+# Loan Eligibility Engine
 
-# Serverless Framework Python HTTP API on AWS
+The Loan Eligibility Engine accepts a CSV file containing users, saves the
+users in PostgreSQL, and starts a loan-product matching process.
 
-This template demonstrates how to make a simple HTTP API with Python running on AWS Lambda and API Gateway using the Serverless Framework.
+The application is built as a small serverless pipeline:
 
-The project now includes a PostgreSQL-ready SQLAlchemy database layer. See
-the [Database layer](#database-layer) section for configuration and usage.
+1. A browser asks for a temporary upload URL.
+2. The browser uploads the CSV directly to Amazon S3.
+3. S3 sends an event to Amazon SQS.
+4. AWS Lambda reads the CSV in small batches and saves valid rows to PostgreSQL.
+5. When the upload is complete, another Lambda calls the matching n8n workflow.
+6. After matching succeeds, the same Lambda calls the notification n8n workflow.
 
-Lambda uses the shared `clickpe-dependencies` layer for Python dependencies.
-The functions run on Python 3.12 and x86_64 so the packaged PostgreSQL driver
-matches the Lambda runtime.
+The project is intentionally simple. CSV validation is minimal, large files are
+processed in chunks, and n8n handles the matching and notification workflows.
 
-## Usage
+---
 
-### CSV upload interface
-
-The project includes a small browser interface under `frontend/`. It requests a
-presigned upload URL from the API and uploads the selected CSV directly to S3.
-The CSV file does not pass through the browser's API request or Lambda.
-
-After deploying the Serverless application, start a simple local web server
-from the project root:
-
-```bash
-python -m http.server 8080 --directory frontend
-```
-
-Open `http://localhost:8080`, choose a `.csv` file, and click **Upload CSV**.
-The frontend is already configured to use the deployed upload API.
-
-The interface displays the resulting `job_id` after S3 accepts the upload.
-The ingestion pipeline then processes the file in the background.
-
-After the matching workflow completes, Workflow B should call the Workflow C
-n8n webhook with the same `job_id`:
+## 1. Architecture at a glance
 
 ```text
-POST https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
-Content-Type: application/json
+Browser
+   |
+   | POST /ingestions/upload-url
+   v
+API Gateway
+   |
+   v
+createUploadUrl Lambda --------> PostgreSQL
+   |
+   | temporary presigned URL
+   v
+Browser -----------------------> S3
+                                  |
+                                  | object-created event
+                                  v
+                           Ingestion SQS Queue
+                                  |
+                                  v
+                           ingestUsers Lambda
+                                  |
+                                  | read CSV chunks
+                                  v
+                              PostgreSQL
+                                  |
+                                  | ingestion.completed
+                                  v
+                           Matching SQS Queue
+                                  |
+                                  v
+                        triggerMatching Lambda
+                                  |
+                                  | 1. {"job_id": "..."}
+                                  v
+                       n8n Workflow B: Matching
+                                  |
+                                  | matching must finish first
+                                  v
+                       n8n Workflow C: Email
+                                  |
+                                  v
+                         SES / test email inbox
 ```
+
+### Important Workflow B and Workflow C detail
+
+The application calls the workflows in this order:
+
+```text
+triggerMatching Lambda
+        |
+        | call Workflow B
+        | wait for a successful response
+        v
+call Workflow C
+```
+
+Workflow C is the third workflow in the business process. It receives the same
+`job_id` as Workflow B. The application calls Workflow C from
+`pipeline/matching.py`; Workflow B must not call Workflow C again, or it will be
+triggered twice.
+
+Workflow B must be configured to return its successful webhook response only
+after the matching nodes have finished. If it responds immediately, Workflow C
+could start before the matches are stored.
+
+The application sends this small JSON body to both workflows:
 
 ```json
 {
-  "job_id": "..."
+  "job_id": "the-ingestion-job-id"
 }
 ```
 
-The deployed matching Lambda now performs this handoff itself: it calls
-`N8N_WEBHOOK_URL` first, waits for a successful response, and then calls
-`N8N_WORKFLOW_C_WEBHOOK_URL` with the same body. Configure Workflow B to return
-its webhook response only after its last matching node has finished.
+The actual webhook URLs are provided through environment variables. They are not
+hard-coded in the Python application.
 
-### Deployment
+---
 
-```
-serverless deploy
-```
+## 2. How a CSV upload works
 
-After deploying, you should see output similar to:
+### Step 1: The browser asks for an upload URL
 
-```
-Deploying "aws-python-http-api" to stage "dev" (us-east-1)
+The frontend sends:
 
-✔ Service deployed to stack aws-python-http-api-dev (85s)
-
-endpoint: GET - https://6ewcye3q4d.execute-api.us-east-1.amazonaws.com/
-functions:
-  hello: aws-python-http-api-dev-hello (2.3 kB)
+```http
+POST /ingestions/upload-url
 ```
 
-_Note_: In current form, after deployment, your API is public and can be invoked by anyone. For production deployments, you might want to configure an authorizer. For details on how to do that, refer to [http event docs](https://www.serverless.com/framework/docs/providers/aws/events/apigateway/).
+The `createUploadUrl` Lambda:
 
-### Invocation
+1. Creates a unique `job_id`.
+2. Creates an S3 object key:
 
-After successful deployment, you can call the created application via HTTP:
+   ```text
+   incoming/{job_id}/users.csv
+   ```
 
-```
-curl https://xxxxxxx.execute-api.us-east-1.amazonaws.com/
-```
+3. Creates an `ingestion_jobs` record in PostgreSQL.
+4. Creates a temporary S3 presigned URL.
+5. Returns the job ID and upload URL to the browser.
 
-Which should result in response similar to the following (removed `input` content for brevity):
+The browser never receives AWS credentials. The presigned URL only gives the
+browser temporary permission to upload that one file.
 
-```json
-{
-  "message": "Go Serverless v4.0! Your function executed successfully!"
-}
-```
+### Step 2: The browser uploads directly to S3
 
-### Local development
+The browser sends the CSV to S3 with a `PUT` request. The CSV does not pass
+through API Gateway or Lambda. This keeps the upload path suitable for larger
+files and avoids putting the whole file in Lambda memory.
 
-You can invoke your function locally by using the following command:
+The upload uses the `text/csv` content type and a regional S3 Signature V4 URL.
+The regional URL avoids browser problems caused by S3 redirects.
 
-```
-serverless invoke local --function hello
-```
+### Step 3: S3 starts background processing
 
-Which should result in response similar to the following:
+The S3 bucket sends an object-created message to the ingestion SQS queue when a
+CSV under `incoming/` has been uploaded.
 
-```json
-{
-  "statusCode": 200,
-  "body": "{\n  \"message\": \"Go Serverless v4.0! Your function executed successfully!\"}"
-}
-```
+SQS separates the upload from the processing. If the database or S3 has a
+temporary problem, the message can be retried instead of losing the upload.
 
-Alternatively, it is also possible to emulate API Gateway and Lambda locally by using `serverless-offline` plugin. In order to do that, execute the following command:
+### Step 4: The ingestion Lambda reads the CSV in chunks
 
-```
-serverless plugin install -n serverless-offline
-```
+The `ingestUsers` Lambda does not load the entire file at once. It reads a
+limited number of rows, saves them, and records where the next chunk should
+start.
 
-It will add the `serverless-offline` plugin to `devDependencies` in `package.json` file as well as will add it to `plugins` in `serverless.yml`.
+The default batch size is:
 
-After installation, you can start local emulation with:
-
-```
-serverless offline
+```text
+INGESTION_BATCH_ROWS=1000
 ```
 
-To learn more about the capabilities of `serverless-offline`, please refer to its [GitHub repository](https://github.com/dherault/serverless-offline).
+The saved cursor contains values such as:
 
-### Bundling dependencies
+- The next S3 byte offset.
+- The next CSV row number.
+- The next chunk number.
+- The CSV headers.
 
-In case you would like to include 3rd party dependencies, no plugin install is needed — the Serverless Framework bundles Python dependencies natively. Simply add your dependencies to a `requirements.txt` file (`Pipfile` and `pyproject.toml` are also supported but require additional configuration) and, if you don't already have one, add a `custom.pythonRequirements` block to your `serverless.yml` to activate and configure the built-in packaging, for example:
+If more rows remain, the Lambda sends a continuation message to the ingestion
+queue. A large file therefore becomes a simple sequence:
 
-```yml
-custom:
-  pythonRequirements: {}
+```text
+chunk 0 -> chunk 1 -> chunk 2 -> ... -> completed
 ```
 
-They will then be automatically injected into the Lambda package during the build process.
+Chunks for one job are processed in order. Different jobs can still progress in
+parallel when AWS has available Lambda capacity.
 
-## Database layer
+### Step 5: CSV validation stays minimal
 
-The project includes a small SQLAlchemy 2.x database layer under `database/`:
+This is a prototype, so the parser checks only what the pipeline needs:
 
-- `database/config.py` loads `DATABASE_URL` and optional pool settings from the
-  environment. For local development it also loads `.env` without overriding
-  values already present in the process environment.
-- `database/models.py` defines the shared SQLAlchemy `Base`, the six ORM
-  models, relationships, PostgreSQL constraints, and migration-safe naming
-  conventions.
-- `database/session.py` creates one process-wide engine and session factory,
-  then provides transaction-scoped sessions for individual requests.
+- The CSV has a `user_id` column.
+- Each accepted row has a `user_id` value.
+- Numeric fields contain valid numbers when they are supplied.
+- Numeric fields are not negative.
 
-Install the pinned dependencies and create a local environment file:
+The parser does not perform strict email validation or extensive business
+validation. Invalid rows are rejected and recorded in the `crawl_errors` table;
+valid rows in the same batch continue to be processed.
 
-```bash
-python -m pip install -r requirements.lock
-cp .env.example .env
+### Step 6: Users are saved safely
+
+Valid rows are inserted into PostgreSQL. The database prevents the same
+`source_user_id` from being inserted twice for the same job:
+
+```text
+unique (ingestion_job_id, source_user_id)
 ```
 
-Set `DATABASE_URL` in `.env` to the PostgreSQL connection string for the local
-database. The application normalizes a `postgresql://` value to the explicit
-`postgresql+psycopg://` SQLAlchemy driver URL. In AWS, provide `DATABASE_URL`
-through the deployment environment or a managed secret; do not deploy the
-local `.env` file.
+This protects the database when an S3 event or SQS message is delivered more
+than once.
 
-Use a session as a short-lived transaction boundary inside an API handler or
-service function:
+When the final chunk is complete, the job is marked as `completed`. The system
+also creates a durable webhook delivery record with the `job_id`.
 
-```python
-from database.session import session_scope
+### Step 7: Matching and notification start
 
+The `triggerMatching` Lambda receives the durable delivery ID from the matching
+SQS queue. It then:
 
-def perform_database_work():
-    with session_scope() as session:
-        # Query or mutate ORM models here.
-        ...
+1. Loads the saved `job_id` from PostgreSQL.
+2. Calls Workflow B using `N8N_WEBHOOK_URL`.
+3. Waits for a successful 2xx response.
+4. Calls Workflow C using `N8N_WORKFLOW_C_WEBHOOK_URL`.
+5. Marks the delivery as sent only after both calls succeed.
+
+If either workflow fails, the delivery is marked as failed and SQS can retry the
+message. After the configured retry count, the message moves to the matching
+dead-letter queue.
+
+The application only triggers the n8n workflows. Workflow B is responsible for
+creating or updating matches. Workflow C is responsible for reading the
+completed matches and sending the notification emails through its configured
+email provider, such as Amazon SES.
+
+---
+
+## 3. CSV format
+
+The required column is `user_id`. The other supported columns are optional:
+
+```csv
+user_id,name,email,monthly_income,credit_score,employment_status,age
+u-001,Jane Doe,jane@example.com,3500,720,Employed,31
+u-002,John Doe,john@example.com,2800,680,Self-employed,28
 ```
 
-The context manager commits successful work, rolls back failed work, and
-closes the session. Do not keep a `Session` globally, create an engine per
-request, or dispose the shared engine after every Lambda invocation.
+The database stores these fields as:
 
-Alembic is configured under `alembic/` with migrations for the six tables,
-including `crawl_errors` for recording crawl failures by source URL and
-processing stage. Run migrations as a controlled deployment step, not during
-Lambda cold starts or API requests:
+| CSV column | Database field | Required? |
+| --- | --- | --- |
+| `user_id` | `source_user_id` | Yes |
+| `name` | `full_name` | No |
+| `email` | `email` | No |
+| `monthly_income` | `monthly_income` | No |
+| `credit_score` | `credit_score` | No |
+| `employment_status` | `employment_status` | No |
+| `age` | `age` | No |
+
+The notification workflow should use the configured test inbox aliases for the
+prototype. It should not send messages to email addresses from the sample CSV.
+
+---
+
+## 4. Project structure
+
+```text
+loan-eligibility-engine/
+├── serverless.yml              AWS, Lambda, S3, SQS, IAM, and environment setup
+├── handler.py                  Small example health endpoint
+├── pipeline/
+│   ├── config.py                Pipeline environment settings
+│   ├── upload.py                Upload URL API Lambda
+│   ├── csv_ingestion.py         Streaming CSV parser and minimal validation
+│   ├── ingestion.py             S3/SQS ingestion worker
+│   └── matching.py              Workflow B then Workflow C delivery worker
+├── database/
+│   ├── config.py                Database URL and connection settings
+│   ├── models.py                SQLAlchemy database models
+│   └── session.py               Shared engine and transaction sessions
+├── alembic/
+│   ├── env.py                   Alembic database configuration
+│   └── versions/                Database migration files
+├── frontend/
+│   ├── index.html               CSV upload page
+│   ├── app.js                   Requests the URL and uploads to S3
+│   └── styles.css               Upload page styling
+├── tests/
+│   ├── test_csv_ingestion.py    CSV parsing and validation tests
+│   ├── test_pipeline_messages.py S3/SQS message parsing tests
+│   └── test_matching_webhooks.py Workflow B -> Workflow C ordering test
+├── docs/
+│   └── pipeline-flow.md         Detailed pipeline and scalability notes
+├── requirements.txt              Runtime dependency list
+├── requirements.lock             Locked runtime dependencies
+├── requirements-dev.txt           Runtime plus development dependencies
+├── requirements-dev.lock          Locked development dependencies
+├── .env.example                  Safe environment-variable template
+└── README.md                     This document
+```
+
+### Main application files
+
+#### `serverless.yml`
+
+This is the deployment definition. It creates and configures:
+
+- AWS Lambda functions.
+- An encrypted S3 upload bucket.
+- An ingestion SQS queue and dead-letter queue.
+- A matching SQS queue and dead-letter queue.
+- S3-to-SQS event notifications.
+- IAM roles and permissions.
+- Lambda environment variables.
+
+The current deployment settings are:
+
+```text
+AWS region:   ap-southeast-2
+Python:       3.12
+Architecture: x86_64
+```
+
+All Lambda functions use the configured shared dependency layer.
+
+#### `pipeline/upload.py`
+
+Contains the `create_upload_url` Lambda handler. It creates a job, builds the
+S3 key, creates a regional presigned URL, and returns the upload information.
+
+#### `pipeline/csv_ingestion.py`
+
+Contains the small streaming CSV parser. It returns a `CsvChunk` containing:
+
+- Accepted rows.
+- Rejected row errors.
+- The next byte offset.
+- The next row number.
+- Whether more data remains.
+- The CSV headers.
+
+There is no separate `ParsedUserRow` object. Keeping the result as `CsvChunk`
+makes the prototype easier to follow.
+
+#### `pipeline/ingestion.py`
+
+Coordinates the ingestion process. It parses S3 and continuation messages,
+claims chunks, reads byte ranges from S3, writes users and errors to PostgreSQL,
+updates job progress, creates continuation messages, and creates the durable
+webhook delivery when the job is complete.
+
+#### `pipeline/matching.py`
+
+Processes the matching SQS message. It protects the webhook delivery from
+duplicate processing, calls Workflow B, calls Workflow C after Workflow B
+succeeds, records the result, and allows SQS to retry failed calls.
+
+#### `database/models.py`
+
+Defines the PostgreSQL schema used by the application:
+
+- `ingestion_jobs`: one record for each CSV upload.
+- `users`: users imported from a CSV job.
+- `loan_products`: loan products and their criteria.
+- `matches`: the result for one user and one loan product.
+- `notifications`: notification attempts associated with matches.
+- `crawl_errors`: rejected rows and processing errors.
+- `ingestion_chunks`: progress and state for each CSV chunk.
+- `webhook_deliveries`: durable Workflow B and Workflow C delivery state.
+
+#### `database/session.py`
+
+Creates one SQLAlchemy engine per warm process and provides short-lived,
+transaction-scoped sessions. A successful session commits; a failed session is
+rolled back and closed.
+
+#### `alembic/versions/`
+
+Contains the database migrations. Migrations should be run as a deployment step,
+not during a Lambda cold start or a user request.
+
+#### `frontend/`
+
+Contains a simple browser page for selecting and uploading a CSV. The browser
+requests the upload URL from the deployed API and then uploads the file directly
+to S3.
+
+#### `tests/`
+
+Contains offline tests for the parser, message handling, and Workflow B to
+Workflow C call order. The tests do not call AWS, n8n, or SES.
+
+---
+
+## 5. Database and migrations
+
+The application uses PostgreSQL through SQLAlchemy and the Psycopg driver.
+
+The database URL can use either of these forms:
+
+```text
+postgresql://user:password@host:5432/database
+postgresql+psycopg://user:password@host:5432/database
+```
+
+The application normalizes the first form to the explicit Psycopg driver.
+
+After setting `DATABASE_URL`, run:
 
 ```bash
 alembic upgrade head
 ```
 
-The migrations use PostgreSQL-specific types and constraints because the
-application database is PostgreSQL. Migration `0004_add_uuid_server_defaults`
-also enables PostgreSQL-side UUID generation so raw SQL clients can omit UUID
-primary keys. The ORM still retains Python-side UUID defaults for SQLAlchemy
-inserts.
+To see the current migration:
 
-The ORM currently stores one current match per user/product pair and enforces
-one unique `(lender_name, product_name)` pair for loan products. It cascades
-dependent records when a parent is deleted. If duplicate loan products already
-exist, migration `0003_loan_product_name_unique` stops before changing the
-schema so related matches can be reconciled safely first.
-The notification service, not the ORM layer, is responsible for routing emails
-to the configured test inbox.
+```bash
+alembic current
+```
+
+The database uses constraints and state fields for safety. For example:
+
+- Duplicate users for one job are ignored and recorded as rejected.
+- A completed chunk is not processed again.
+- A webhook delivery has one durable record per job and event type.
+- Parent deletion cascades to related users, chunks, matches, and errors.
+
+---
+
+## 6. Local setup
+
+### Requirements
+
+Install or provide:
+
+- Python 3.12.
+- Node.js and the Serverless Framework for deployment.
+- A PostgreSQL database.
+- AWS credentials for deployment and local AWS access.
+- n8n Workflow B and Workflow C webhook URLs.
+
+### Create a virtual environment
+
+On Windows PowerShell:
+
+```powershell
+py -3.12 -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.lock
+```
+
+On Linux or macOS:
+
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.lock
+```
+
+The lock file pins the runtime and development packages so the project can be
+rebuilt consistently.
+
+### Configure environment variables
+
+Copy the example file:
+
+```bash
+cp .env.example .env
+```
+
+On Windows PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Set at least these values in `.env`:
+
+```env
+DATABASE_URL=postgresql+psycopg://username:password@localhost:5432/loan_eligibility
+N8N_WEBHOOK_URL=https://your-n8n-host/webhook/match-users
+N8N_WORKFLOW_C_WEBHOOK_URL=https://your-n8n-host/webhook/workflow-c
+```
+
+Never commit `.env`. Use `.env.example` for safe placeholders only.
+
+### Prepare the database
+
+```bash
+alembic upgrade head
+```
+
+### Run the tests
+
+Use the project virtual environment:
+
+```bash
+python -m pytest -q
+```
+
+On Windows, if the environment is not activated, use:
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q
+```
+
+The tests are designed to run offline and do not require AWS or n8n.
+
+---
+
+## 7. Run the frontend locally
+
+From the project root, start a simple web server:
+
+```bash
+python -m http.server 8080 --directory frontend
+```
+
+Then open:
+
+```text
+http://localhost:8080
+```
+
+Choose a CSV file and click **Upload CSV**. The page displays the returned
+`job_id` after S3 accepts the file. Processing continues in the background.
+
+The deployed upload API URL is currently stored in:
+
+```text
+frontend/app.js
+```
+
+If the API is deployed to a different stage or account, update that value before
+using the frontend.
+
+---
+
+## 8. Deploy to AWS
+
+The Serverless Framework reads the AWS settings from `serverless.yml` and the
+environment variables from the deployment shell or `.env`.
+
+Check the rendered configuration:
+
+```bash
+serverless print
+```
+
+Create a deployment package:
+
+```bash
+serverless package
+```
+
+Deploy the service:
+
+```bash
+serverless deploy
+```
+
+After deployment:
+
+1. Confirm the Lambda functions and queues were created.
+2. Confirm the database is at the latest Alembic migration.
+3. Confirm Workflow B waits for matching to finish before returning success.
+4. Upload a test CSV through the frontend.
+5. Check that Workflow B and Workflow C receive the same `job_id`.
+6. Check the notification workflow and SES test inbox.
+
+The deployment does not package `.env` or the local virtual environment.
+
+---
+
+## 9. Error handling and retries
+
+### Temporary AWS or database failure
+
+The Lambda raises an error and the SQS message is retried. The database chunk
+state prevents successful work from being inserted twice.
+
+### Invalid CSV row
+
+The row is rejected and written to `crawl_errors`. Other valid rows in the same
+chunk continue.
+
+### Invalid CSV file
+
+An empty file, malformed CSV, invalid header, or missing `user_id` causes the
+job to be marked as failed. Retrying the same invalid file will not fix it.
+
+### Duplicate S3 or SQS delivery
+
+The job and chunk records are checked before processing. Completed chunks are
+skipped, and the database uniqueness constraint protects the users table.
+
+### Workflow B or Workflow C failure
+
+The webhook delivery records the latest error and HTTP status. The matching SQS
+message is retried. After repeated failures, the message moves to the matching
+dead-letter queue.
+
+---
+
+## 10. Current prototype limits
+
+This is a working prototype, not a production security configuration.
+
+- The upload API does not currently use an authorizer.
+- The S3 bucket CORS rule is open for the prototype frontend.
+- The upload URL is temporary, but anyone who receives it may use it before it
+  expires.
+- Webhook authentication and request signing are not implemented here.
+- Workflow B and Workflow C are external n8n workflows and are not stored in
+  this repository.
+- The database and n8n capacity should be measured before handling production
+  traffic.
+- The current matching delivery retries the saved delivery if Workflow C fails;
+  review Workflow B idempotency before production use.
+
+Before production use, add authentication, restrict CORS, protect webhook
+endpoints, manage secrets through a secret manager, and add monitoring.
+
+---
+
+## 11. Useful commands
+
+```bash
+# Install dependencies
+python -m pip install -r requirements-dev.lock
+
+# Run tests
+python -m pytest -q
+
+# Compile-check Python files
+python -m compileall -q pipeline database alembic tests
+
+# Check dependency consistency
+python -m pip check
+
+# Check migration state
+alembic current
+
+# Render and package Serverless configuration
+serverless print
+serverless package
+
+# Serve the frontend
+python -m http.server 8080 --directory frontend
+```
+
+For the most reliable local checks on Windows, run these commands with the
+project interpreter:
+
+```powershell
+.\venv\Scripts\python.exe -m pytest -q
+.\venv\Scripts\python.exe -m compileall -q pipeline database alembic tests
+```

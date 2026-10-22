@@ -65,7 +65,7 @@ directly to S3 using that URL.
 const response = await fetch(
   "https://1ptrorx4i9.execute-api.ap-southeast-2.amazonaws.com/ingestions/upload-url",
   {
-  method: "POST",
+    method: "POST",
   },
 );
 
@@ -249,9 +249,10 @@ This creates a simple chain:
 S3 event -> chunk 0 -> chunk 1 -> chunk 2 -> completed
 ```
 
-### Matching Lambda: notify n8n
+### Matching Lambda: start Workflow B
 
-After the final chunk, the matching Lambda sends only the job ID:
+After the final chunk, the matching Lambda sends only the job ID to the
+matching workflow, Workflow B:
 
 ```python
 payload = {"job_id": str(job_id)}
@@ -275,6 +276,66 @@ curl -X POST "$N8N_WEBHOOK_URL" \
   -H "Content-Type: application/json" \
   -d '{"job_id":"8c1f..."}'
 ```
+
+### Workflow B: start Workflow C after matching finishes
+
+The matching Lambda now performs this handoff. It calls Workflow B using
+`N8N_WEBHOOK_URL`, waits for a successful response, and then calls Workflow C
+using `N8N_WORKFLOW_C_WEBHOOK_URL`.
+
+Configure Workflow B to respond only after its last matching node has finished.
+Do not configure Workflow C to be called from inside Workflow B as well, or it
+will be triggered twice.
+
+Workflow C webhook:
+
+```text
+https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
+```
+
+The Lambda sends the following request to Workflow C:
+
+```text
+Method: POST
+URL: https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
+Content-Type: application/json
+```
+
+Send this body:
+
+```json
+{
+  "job_id": "8c1f..."
+}
+```
+
+The Lambda replaces the example value with the actual job ID at runtime.
+
+The important requirement is that Workflow C receives exactly the job ID for
+the matching job.
+
+The resulting flow is:
+
+```text
+Ingestion complete
+        |
+        v
+Lambda calls Workflow B with {"job_id": "..."}
+        |
+        v
+Workflow B creates/finishes user matches
+        |
+        v
+Matching Lambda calls Workflow C webhook after Workflow B returns
+        |
+        | {"job_id": "..."}
+        v
+Workflow C reads matched users and sends test emails through SES
+```
+
+Workflow B should call Workflow C only after its matching operation has
+completed. Calling the new webhook from the ingestion Lambda would be too
+early because matching would not have finished yet.
 
 ## 2. Step-by-step flow
 
