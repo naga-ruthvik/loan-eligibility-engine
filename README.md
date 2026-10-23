@@ -36,21 +36,6 @@ The application is a small serverless pipeline:
 
 ![Architecture Diagram](docs/architecture.png)
 
-> ⚠️ **Ordering constraint — read this before touching either workflow.**
-> Workflow B and Workflow C are **not** chained to each other. The call chain is driven entirely by `triggerMatching`, from `pipeline/matching.py`:
->
-> ```text
-> matching SQS queue
->         │
->         ▼
-> triggerMatching Lambda
->         │
->         ├──▶ call Workflow B webhook ──▶ wait for a 2xx response
->         │
->         └──▶ call Workflow C webhook  (only after Workflow B succeeds)
-> ```
->
-
 ## 2. n8n Workflows in detail
 
 ### Workflow A — Loan Product Ingestion & Extraction
