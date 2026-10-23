@@ -1,795 +1,309 @@
-# CSV Ingestion Flow and Scalability Guide
+# Pipeline Flow
 
-This document explains the CSV upload pipeline in simple terms. It is written
-for a developer who is new to AWS Lambda, S3, SQS, and asynchronous processing.
+This document explains how a CSV moves through the application and how the
+external n8n workflows fit into the process.
 
-## 1. The big picture
+The Python code owns file upload, ingestion, database state, and the start of
+the matching workflow. The n8n workflows own product discovery, matching, and
+notifications.
 
-The frontend does not send the CSV through Lambda. Instead, it uploads the file
-directly to S3. S3 then starts the background processing flow.
+## 1. Complete flow
 
 ```text
-Frontend
+Browser
    |
-   | 1. Ask for an upload URL
+   | Request an upload URL
    v
 API Gateway -> createUploadUrl Lambda -> PostgreSQL
    |
-   | 2. Return a temporary S3 upload URL
+   | Return temporary upload permission
    v
-Frontend -- 3. Upload CSV directly --> S3
+Browser ---------------------------> S3
                                       |
-                                      | 4. Object-created event
+                                      | Object-created event
                                       v
                                Ingestion SQS Queue
                                       |
-                                      | 5. SQS invokes Lambda
                                       v
                                ingestUsers Lambda
                                       |
-                                      | 6. Read CSV in batches
+                                      | Read and save chunks
                                       v
                                   PostgreSQL
                                       |
-                                      | 7. Job completed
+                                      | Ingestion completed
                                       v
                                Matching SQS Queue
                                       |
                                       v
-                             triggerMatching Lambda
+                            triggerMatching Lambda
                                       |
-                                      | 8. POST {"job_id": "..."}
+                                      | Start Workflow B only
                                       v
-                                      n8n
+                         Workflow B - external n8n
+                                      |
+                                      | After matching finishes
+                                      v
+                         Workflow C - external n8n
+                                      |
+                                      v
+                           SES / test inbox
 ```
 
-There are two separate background steps:
-
-1. **Ingestion:** read the CSV and save users.
-2. **Matching notification:** tell n8n that ingestion is complete.
-
-Keeping these steps separate means a slow or unavailable n8n endpoint does not
-stop the CSV from being saved in PostgreSQL.
-
-## 1.1. The same flow as code
-
-The following snippets are shortened versions of the real project code. They
-show how the pieces connect without including every error-handling detail.
-
-### Frontend: request a URL and upload the file
-
-The frontend first asks the API for an upload URL. It then sends the file
-directly to S3 using that URL.
-
-```javascript
-const response = await fetch(
-  "https://1ptrorx4i9.execute-api.ap-southeast-2.amazonaws.com/ingestions/upload-url",
-  {
-    method: "POST",
-  },
-);
-
-const upload = await response.json();
-
-await fetch(upload.upload_url, {
-  method: "PUT",
-  headers: {
-    "Content-Type": "text/csv",
-  },
-  body: csvFile,
-});
-
-console.log("Upload started for job:", upload.job_id);
-```
-
-The browser sends the CSV to S3. It does not send the CSV body to the Lambda.
-
-### Upload Lambda: create the job and presigned URL
-
-The API Lambda creates the job ID, stores the job, and creates the S3 URL:
-
-```python
-job_id = uuid4()
-object_key = f"incoming/{job_id}/users.csv"
-
-upload_url = s3_client.generate_presigned_url(
-    ClientMethod="put_object",
-    Params={
-        "Bucket": settings.upload_bucket,
-        "Key": object_key,
-        "ContentType": "text/csv",
-    },
-    ExpiresIn=settings.presigned_url_expires_seconds,
-)
-
-with session_scope() as session:
-    session.add(
-        IngestionJob(
-            id=job_id,
-            s3_bucket=settings.upload_bucket,
-            s3_key=object_key,
-        )
-    )
-```
-
-The S3 key contains the job ID, so later workers can connect the S3 file to
-the correct database job.
-
-### S3 event: start the ingestion worker
-
-S3 sends a message to SQS after the upload finishes. The ingestion Lambda
-receives the SQS record and processes it:
-
-```python
-def process_sqs_record(record: dict[str, Any]) -> None:
-    work_item = parse_work_item(record.get("body", ""))
-    follow_up = _process_work_item(work_item)
-    _publish_follow_up(follow_up, work_item)
-```
-
-`parse_work_item` extracts values such as:
-
-```python
-WorkItem(
-    job_id=job_id,
-    bucket="generated-bucket",
-    key=f"incoming/{job_id}/users.csv",
-    chunk_number=0,
-    start_byte_offset=0,
-    start_row_number=2,
-    initial_chunk=True,
-)
-```
-
-### Ingestion Lambda: read one batch
-
-The worker reads only one batch from S3:
-
-```python
-s3_params = {
-    "Bucket": work_item.bucket,
-    "Key": work_item.key,
-}
-
-if work_item.start_byte_offset > 0:
-    s3_params["Range"] = f"bytes={work_item.start_byte_offset}-"
-
-response = s3_client.get_object(**s3_params)
-
-chunk = parse_csv_chunk(
-    response["Body"],
-    start_byte_offset=work_item.start_byte_offset,
-    start_row_number=work_item.start_row_number,
-    max_rows=settings.ingestion_batch_rows,
-    initial_chunk=work_item.initial_chunk,
-    headers=work_item.headers,
-)
-```
-
-The first chunk starts at byte `0`. A later chunk starts from the byte offset
-saved by the previous chunk.
-
-### CSV parser: return valid rows and errors
-
-The parser keeps the result simple:
-
-```python
-CsvChunk(
-    rows=[
-        {
-            "source_user_id": "u-123",
-            "full_name": "Jane Doe",
-            "email": "jane@example.com",
-            "monthly_income": Decimal("2500"),
-            "credit_score": 700,
-            "employment_status": "Employed",
-            "age": 30,
-        }
-    ],
-    errors=[],
-    next_byte_offset=45821,
-    next_row_number=1002,
-    has_more=True,
-    headers=["user_id", "name", "email"],
-)
-```
-
-`rows` can be inserted into PostgreSQL. `errors` become records in
-`crawl_errors`.
-
-### Ingestion Lambda: insert rows safely
-
-The database insert ignores a duplicate source user ID for the same job:
-
-```python
-values = [
-    {**row, "ingestion_job_id": work_item.job_id}
-    for row in csv_chunk.rows
-]
-
-statement = (
-    pg_insert(User)
-    .values(values)
-    .on_conflict_do_nothing(
-        constraint="uq_users_ingestion_job_source_user_id"
-    )
-)
-
-session.execute(statement)
-```
-
-The unique constraint is the final protection against duplicate database rows.
-
-### Ingestion Lambda: continue with another message
-
-If there are more rows, the worker sends a continuation message:
-
-```python
-if csv_chunk.has_more:
-    continuation = {
-        "job_id": str(work_item.job_id),
-        "bucket": work_item.bucket,
-        "key": work_item.key,
-        "chunk_number": work_item.chunk_number + 1,
-        "start_byte_offset": csv_chunk.next_byte_offset,
-        "start_row_number": csv_chunk.next_row_number,
-        "initial_chunk": False,
-        "headers": csv_chunk.headers,
-    }
-
-    sqs.send_message(
-        QueueUrl=settings.ingestion_queue_url,
-        MessageBody=json.dumps(continuation),
-    )
-```
-
-This creates a simple chain:
+The important ownership rule is:
 
 ```text
-S3 event -> chunk 0 -> chunk 1 -> chunk 2 -> completed
+Lambda starts Workflow B.
+Workflow B starts Workflow C inside n8n.
+Lambda does not call Workflow C.
 ```
 
-### Matching Lambda: start Workflow B
+Workflow C must be connected after the final matching database write. The
+no-candidate terminal path should also reach the handoff when Workflow C needs
+to record that there are no messages to send. The handoff must run once per job,
+not once per matching batch.
 
-After the final chunk, the matching Lambda sends only the job ID to the
-matching workflow, Workflow B:
+## 2. External workflow configuration
 
-```python
-payload = {"job_id": str(job_id)}
+The n8n workflow definitions are outside this repository.
 
-request = Request(
-    settings.n8n_webhook_url,
-    data=json.dumps(payload).encode("utf-8"),
-    method="POST",
-    headers={"Content-Type": "application/json"},
-)
+- **Workflow A** uses Firecrawl and Google Gemini to discover and extract loan
+  products.
+- **Workflow B** uses PostgreSQL queries and Google Gemini to match users to
+  products.
+- **Workflow C** reads completed matches and uses Amazon SES to send prototype
+  notifications.
 
-with urlopen(request, timeout=settings.webhook_timeout_seconds) as response:
-    if 200 <= response.status < 300:
-        delivery.status = "sent"
-```
+Firecrawl, Google Gemini, Amazon SES, and n8n are external workflow services.
+They are not Python dependencies and are not executed by the Lambda source in
+this repository.
 
-The equivalent request from a terminal would look like this:
+## 3. Upload and ingestion
 
-```bash
-curl -X POST "$N8N_WEBHOOK_URL" \
-  -H "Content-Type: application/json" \
-  -d '{"job_id":"8c1f..."}'
-```
+### Step 1: Request an upload URL
 
-### Workflow B: start Workflow C after matching finishes
-
-The matching Lambda now performs this handoff. It calls Workflow B using
-`N8N_WEBHOOK_URL`, waits for a successful response, and then calls Workflow C
-using `N8N_WORKFLOW_C_WEBHOOK_URL`.
-
-Configure Workflow B to respond only after its last matching node has finished.
-Do not configure Workflow C to be called from inside Workflow B as well, or it
-will be triggered twice.
-
-Workflow C webhook:
-
-```text
-https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
-```
-
-The Lambda sends the following request to Workflow C:
-
-```text
-Method: POST
-URL: https://naga-ruthvik.app.n8n.cloud/webhook/d4fbedc6-3ae7-4e5b-811a-a05382774200
-Content-Type: application/json
-```
-
-Send this body:
-
-```json
-{
-  "job_id": "8c1f..."
-}
-```
-
-The Lambda replaces the example value with the actual job ID at runtime.
-
-The important requirement is that Workflow C receives exactly the job ID for
-the matching job.
-
-The resulting flow is:
-
-```text
-Ingestion complete
-        |
-        v
-Lambda calls Workflow B with {"job_id": "..."}
-        |
-        v
-Workflow B creates/finishes user matches
-        |
-        v
-Matching Lambda calls Workflow C webhook after Workflow B returns
-        |
-        | {"job_id": "..."}
-        v
-Workflow C reads matched users and sends test emails through SES
-```
-
-Workflow B should call Workflow C only after its matching operation has
-completed. Calling the new webhook from the ingestion Lambda would be too
-early because matching would not have finished yet.
-
-## 2. Step-by-step flow
-
-### Step 1: The frontend asks for an upload URL
-
-The frontend calls:
+The frontend sends:
 
 ```http
 POST /ingestions/upload-url
 ```
 
-The `createUploadUrl` Lambda does three things:
+The upload Lambda:
 
 1. Creates a unique `job_id`.
-2. Creates an S3 key using that job ID:
+2. Creates an S3 key:
 
    ```text
    incoming/{job_id}/users.csv
    ```
 
 3. Creates an `ingestion_jobs` row in PostgreSQL.
+4. Creates a temporary S3 upload URL.
+5. Returns the job ID and upload details to the browser.
 
-The Lambda then returns a temporary presigned S3 URL:
+The browser does not send the CSV body through Lambda. It uploads the file
+directly to S3.
 
-```json
-{
-  "job_id": "8c1f...",
-  "bucket": "the-generated-bucket",
-  "key": "incoming/8c1f.../users.csv",
-  "upload_url": "https://...",
-  "required_headers": {
-    "Content-Type": "text/csv"
-  }
-}
-```
+### Step 2: S3 sends an event to SQS
 
-The URL is temporary. The frontend can use it to upload the file without
-receiving AWS credentials.
+After the upload finishes, S3 sends an object-created message to the ingestion
+SQS queue. The object key contains the job ID, so the worker can connect the
+file to the correct database record.
 
-### Step 2: The frontend uploads directly to S3
+SQS separates the upload from processing. A temporary database or AWS failure
+can therefore be retried without asking the user to upload the file again.
 
-The frontend sends the CSV to the returned URL:
+### Step 3: The ingestion Lambda claims a chunk
 
-```http
-PUT <upload_url>
-Content-Type: text/csv
+The ingestion Lambda receives one SQS record and creates or claims an
+`ingestion_chunks` row before reading S3.
 
-<CSV contents>
-```
-
-The CSV does not pass through API Gateway or Lambda. This is important because
-API Gateway and Lambda are not good places to proxy very large files.
-
-S3 stores the file and creates an object-created event after the upload is
-complete.
-
-### Step 3: S3 sends a message to SQS
-
-The S3 bucket is configured to send `.csv` files under the `incoming/` prefix
-to the ingestion SQS queue.
-
-The S3 event contains information such as:
-
-- Bucket name.
-- Object key.
-- S3 version ID.
-
-The ingestion code gets the job ID from the key:
-
-```text
-incoming/8c1f.../users.csv
-         ^^^^^^
-         job_id
-```
-
-SQS acts as a buffer between S3 and the Lambda. If the database is temporarily
-unavailable, the message can wait and be retried instead of losing the upload.
-
-### Step 4: The ingestion Lambda starts processing
-
-The `ingestUsers` Lambda receives one SQS message and checks the related
-`ingestion_jobs` row.
-
-Before reading the file, it creates or claims an `ingestion_chunks` row. This
-is a simple database lock that prevents two Lambda invocations from processing
-the same chunk at the same time.
-
-The job also stores the cursor for the next part of the file:
+The database stores the cursor for the next part of the file:
 
 - `next_byte_offset`
 - `next_row_number`
 - `next_chunk_number`
+- The CSV headers
 
-These values allow processing to continue later.
+The chunk state prevents two Lambda invocations from processing the same chunk
+at the same time.
 
-### Step 5: The CSV is read in batches
+### Step 4: The worker reads only one part of the file
 
-The default batch size is configured by:
-
-```text
-INGESTION_BATCH_ROWS=1000
-```
-
-The Lambda does not load the entire CSV into memory. It reads a small batch,
-for example:
+The first invocation reads from byte `0`. Later invocations use an S3 range read
+starting at the saved byte offset.
 
 ```text
-Rows 2 through 1001
+S3 object
+  -> chunk 0
+  -> chunk 1
+  -> chunk 2
+  -> ...
 ```
 
-When the next batch is needed, the Lambda reads the S3 object from the saved
-byte offset instead of starting at the beginning:
+The complete CSV is not loaded into Lambda memory. A continuation message is
+sent to the ingestion queue when more rows remain.
 
-```text
-Range: bytes={next_byte_offset}-
-```
+### Step 5: Rows are minimally validated
 
-After processing a batch, it sends a continuation message to the same SQS
-queue:
+The parser checks only what the prototype needs:
 
-```json
-{
-  "job_id": "8c1f...",
-  "bucket": "the-generated-bucket",
-  "key": "incoming/8c1f.../users.csv",
-  "chunk_number": 1,
-  "start_byte_offset": 45821,
-  "start_row_number": 1002,
-  "initial_chunk": false,
-  "headers": [
-    "user_id",
-    "name",
-    "email",
-    "monthly_income",
-    "credit_score",
-    "employment_status",
-    "age"
-  ]
-}
-```
+- The header contains `user_id`.
+- An accepted row has a `user_id` value.
+- Supplied numeric values are valid.
+- Supplied numeric values are not negative.
 
-The next Lambda invocation uses this message to continue from the correct
-place.
+Name, email, and employment status are optional. The prototype does not perform
+strict email validation or extensive field validation.
 
-### Step 6: Rows are minimally validated
+The parser returns a simple `CsvChunk` containing accepted rows, rejected row
+errors, the next byte offset, the next row number, a more-data flag, and the
+headers. There is no separate row wrapper type.
 
-This is a prototype, so validation is intentionally small.
+### Step 6: Valid rows are saved safely
 
-The parser checks:
-
-- The CSV contains a `user_id` column.
-- Every row has a `user_id` value.
-- Numeric fields are valid numbers when supplied.
-- Numeric fields are not negative because PostgreSQL rejects negative values.
-
-Fields such as `name`, `email`, and `employment_status` are optional. The
-prototype does not perform strict email validation or extensive field-length
-validation.
-
-For a valid row, the Lambda creates a database value like:
-
-```python
-{
-    "source_user_id": "u-123",
-    "full_name": "Jane Doe",
-    "email": "jane@example.com",
-    "monthly_income": 2500,
-    "credit_score": 700,
-    "employment_status": "Employed",
-    "age": 30,
-}
-```
-
-For an invalid row, the Lambda does not insert a user. It records the problem
-in `crawl_errors` with the job ID, row number, source user ID, and error message.
-
-### Step 7: Valid rows are saved in PostgreSQL
-
-Valid rows are inserted into the `users` table in a batch.
-
-The database has a unique constraint on:
+Valid rows are inserted into the `users` table. PostgreSQL enforces uniqueness
+for:
 
 ```text
 (ingestion_job_id, source_user_id)
 ```
 
-This means the same user cannot be inserted twice for the same upload job.
+If the same source user appears twice for one job, the duplicate is not inserted
+and is recorded as a rejected row.
 
-The job counters are updated after each chunk:
-
-- `processed_rows`: rows examined so far.
-- `rejected_rows`: invalid or duplicate rows.
-- `next_byte_offset`: where the next chunk starts.
-- `next_row_number`: the next CSV row number.
-- `next_chunk_number`: the next chunk ID.
-
-### Step 8: The job completes
-
-When there are no more CSV rows:
-
-```text
-ingestion_jobs.status = completed
-```
-
-The job stores its final counters and completion time.
-
-The code then creates one `WebhookDelivery` record with this payload:
+The worker updates the job and chunk counters after each successful chunk. When
+the final chunk is complete, the job is marked `completed` and one durable
+`webhook_deliveries` record is created with:
 
 ```json
 {
-  "job_id": "8c1f..."
+  "job_id": "the-ingestion-job-id"
 }
 ```
 
-The delivery record is created before the notification is sent. This is useful
-because the database remembers that the notification still needs to be sent.
+## 4. Starting Workflow B
 
-### Step 9: n8n is notified
+The matching SQS queue receives a message containing the delivery ID. The
+`triggerMatching` Lambda:
 
-The matching SQS queue receives a message containing the delivery ID.
+1. Loads the delivery from PostgreSQL.
+2. Claims it with a database lock.
+3. Sends the saved `job_id` payload to Workflow B.
+4. Records whether Workflow B returned a successful response.
 
-The `triggerMatching` Lambda loads the saved payload and calls the configured
-`N8N_WEBHOOK_URL`:
-
-```http
-POST <N8N_WEBHOOK_URL>
-Content-Type: application/json
-```
-
-Body:
+The request body is:
 
 ```json
 {
-  "job_id": "8c1f..."
+  "job_id": "the-ingestion-job-id"
 }
 ```
 
-If n8n returns a successful 2xx response, the delivery is marked `sent`.
+The Lambda makes one n8n request only. It does not make a second request to
+Workflow C.
 
-If n8n is unavailable, the Lambda records the error and lets SQS retry the
-message.
+When the Lambda records the delivery as `sent`, that means Workflow B accepted
+the request. It does not mean that Workflow C has finished sending email.
 
-## 3. Why this can scale better than one large Lambda call
+## 5. Workflow B to Workflow C inside n8n
 
-### S3 stores the large file
+Workflow B performs the complete matching process:
 
-The file is stored in S3 rather than inside Lambda memory or API Gateway.
-S3 is designed for large objects and durable storage.
+1. Loads the users for the job.
+2. Loads active loan products.
+3. Applies hard eligibility filters.
+4. Applies soft criteria and selects candidate products.
+5. Processes candidate batches.
+6. Writes the final results to `matches`.
+7. Hands the job to Workflow C inside n8n.
 
-### Lambda processes only a batch
+The handoff to Workflow C must be placed after the final matching work, not on a
+per-batch branch. If Workflow B has a no-candidate branch, that branch should
+also converge on the handoff when the notification workflow needs to finish the
+job.
 
-The ingestion Lambda processes a limited number of rows at a time. A large
-file becomes a sequence of small jobs:
+Workflow C receives the same `job_id`. It can then query PostgreSQL for the
+completed matches, group products by user, and send test messages through SES.
 
-```text
-CSV file
-  -> chunk 0
-  -> chunk 1
-  -> chunk 2
-  -> chunk 3
-  -> ...
-```
+The exact n8n mechanism can be the configured workflow-to-workflow trigger or an
+internal n8n HTTP request. It must be configured in n8n and must not be added as
+a second Lambda request.
 
-Memory usage depends mostly on the configured batch size, not on the complete
-CSV file size.
+## 6. Retry behavior
 
-### SQS provides buffering and retries
+### Ingestion failure
 
-SQS separates uploading from processing.
+If S3, PostgreSQL, or another temporary dependency fails, the ingestion Lambda
+returns a failed SQS item. SQS retries the message. Completed chunk state and
+database uniqueness constraints prevent successful work from being duplicated.
 
-If many files are uploaded at once:
+### Invalid file
 
-```text
-S3 -> SQS queue -> Lambda workers
-```
+An empty file, invalid header, malformed CSV, or missing `user_id` is recorded as
+a permanent job failure. Retrying the same invalid file does not fix it.
 
-The messages wait in the queue until Lambda can process them. If a temporary
-failure occurs, SQS retries the message. After repeated failures, the message
-goes to a dead-letter queue for investigation.
+### Matching start failure
 
-### Multiple files can be processed concurrently
+If the matching Lambda cannot successfully notify Workflow B, the delivery is
+marked failed and the matching SQS message is retried. After repeated failures,
+the message moves to the matching dead-letter queue.
 
-The prototype does not set `reservedConcurrency`. This keeps the configuration
-simple and avoids reserving part of a small AWS account concurrency quota.
-Lambda and the SQS event source can use the account's available unreserved
-capacity.
+### Workflow B or Workflow C execution failure
 
-This allows different upload jobs to progress in parallel. The database cursor
-still prevents chunks from the same job from being processed out of order.
+The matching Lambda only knows whether Workflow B accepted the request. Workflow
+B and Workflow C need their own n8n retry and error-handling behavior.
 
-If the database needs protection later, a reserved concurrency value can be
-added after checking the account's Lambda concurrency quota.
+Both workflows should be idempotent by `job_id` because a network timeout can
+leave the caller unsure whether an earlier execution was accepted.
 
-### One individual file is still processed sequentially
+Workflow B already upserts match rows. Workflow C should also prevent duplicate
+emails if the same job is started more than once.
 
-The current design intentionally processes chunks for one job in order:
+## 7. Why the design handles large files
 
-```text
-chunk 0 -> chunk 1 -> chunk 2 -> chunk 3
-```
+### S3 stores the file
 
-This makes resumability and duplicate handling easier to understand.
+S3 stores the complete CSV instead of API Gateway or Lambda memory.
 
-It means that increasing Lambda concurrency does not make one single CSV file
-fully parallel. It mainly allows multiple files to be processed at once.
+### Lambda processes bounded chunks
 
-## 4. Current scalability settings
+Memory use depends mostly on the current chunk size, not the complete file size.
 
-The important settings are in `serverless.yml` and the environment:
+### SQS provides buffering and retry
 
-| Setting | Current value | Meaning |
-| --- | ---: | --- |
-| `INGESTION_BATCH_ROWS` | `1000` | Rows processed by one ingestion call |
-| Ingestion Lambda concurrency | Account-managed | No reserved concurrency is configured |
-| Ingestion Lambda timeout | `900` seconds | Maximum time for one Lambda invocation |
-| Ingestion SQS visibility timeout | `5400` seconds | Time SQS hides a message while it is being processed |
-| Matching Lambda concurrency | Account-managed | No reserved concurrency is configured |
-| SQS retry count | `5` | Attempts before moving to a dead-letter queue |
+Multiple uploads can wait in the queue while Lambda workers process them. A
+failed temporary operation can be retried.
 
-These values are reasonable prototype defaults. They should be measured and
-adjusted after observing real CSV sizes, row sizes, database performance, and
-n8n response times.
+### One job stays ordered
 
-## 5. What happens when something fails?
+Chunks for one job are processed sequentially. Different jobs may progress in
+parallel when AWS has available Lambda capacity.
 
-### Database temporarily unavailable
+## 8. Database tables used by the pipeline
 
-The ingestion Lambda raises an error. SQS keeps the message available for a
-later retry.
+| Table | Purpose |
+|---|---|
+| `ingestion_jobs` | One record for each uploaded CSV. |
+| `users` | Valid users imported from CSV. |
+| `loan_products` | Products used by external matching workflows. |
+| `matches` | Current result for a user and loan product pair. |
+| `notifications` | Notification attempts associated with matches. |
+| `crawl_errors` | Invalid rows and processing errors. |
+| `ingestion_chunks` | Resumable chunk progress and locks. |
+| `webhook_deliveries` | Durable state for starting Workflow B. |
 
-The chunk is protected by database state, so a successful retry does not
-create duplicate users.
-
-### CSV has a bad row
-
-The row is rejected and recorded in `crawl_errors`. Other valid rows in the
-same batch continue to be processed.
-
-### CSV has a bad header or is malformed
-
-The job is marked `failed`, an extraction error is recorded, and retrying the
-same bad file is not useful.
-
-### The same S3 event arrives twice
-
-The database checks the job and chunk state. A completed chunk is not processed
-again.
-
-### The same user appears twice
-
-The database uniqueness constraint prevents a duplicate user for that job. The
-duplicate is counted as rejected.
-
-### n8n is unavailable
-
-The webhook delivery remains unfinished. SQS retries the matching message. If
-all attempts fail, the message goes to the matching dead-letter queue.
-
-## 6. Important scalability limits
-
-The design is efficient, but it is not unlimited.
-
-### PostgreSQL is the main bottleneck
-
-Every valid batch writes to PostgreSQL. As traffic increases, the database may
-become the slowest part of the system.
-
-Possible future improvements include:
-
-- Use a managed PostgreSQL service with suitable connection limits.
-- Tune the SQLAlchemy connection pool.
-- Increase batch size after measuring performance.
-- Add database monitoring.
-- Consider a database proxy if Lambda connection counts become high.
-
-These are future scaling steps, not requirements for the prototype.
-
-### Larger batches are not always better
-
-Increasing `INGESTION_BATCH_ROWS` reduces the number of SQS messages, but it
-also increases:
-
-- Lambda memory usage.
-- Database transaction size.
-- Time spent processing one message.
-- Amount of work repeated after a failure.
-
-The right value should be chosen using measurements rather than guessing.
-
-### n8n may need its own scaling plan
-
-The matching Lambda does not currently have a reserved concurrency value. This
-keeps the free-tier configuration simple and avoids an account-quota deployment
-failure.
-
-If many jobs complete at the same time, the matching queue grows until the
-Lambda can notify n8n. That is safe, but notifications may be delayed.
-
-If n8n needs a strict concurrency limit later, one can be added after checking
-the AWS account quota.
-
-## 7. A simple example
-
-Suppose the frontend uploads a file with 2,500 rows and the batch size is
-1,000.
-
-```text
-Upload completes in S3
-        |
-        v
-SQS message for chunk 0
-        |
-        v
-Lambda reads rows 2-1001
-Lambda saves the rows
-Lambda sends continuation for chunk 1
-        |
-        v
-Lambda reads rows 1002-2001
-Lambda saves the rows
-Lambda sends continuation for chunk 2
-        |
-        v
-Lambda reads the remaining 499 rows
-Lambda marks the job completed
-Lambda creates the webhook delivery
-        |
-        v
-Matching Lambda sends {"job_id": "..."} to n8n
-```
-
-If the Lambda fails while processing chunk 1, SQS retries chunk 1. Chunk 0 is
-not repeated because the database already marks it as completed.
-
-## 8. Code map
+## 9. Code map
 
 | File | Responsibility |
-| --- | --- |
-| `serverless.yml` | AWS resources, queues, Lambda functions, permissions, and settings |
-| `pipeline/upload.py` | Creates the job and presigned S3 upload URL |
-| `pipeline/csv_ingestion.py` | Reads CSV batches and performs minimal validation |
-| `pipeline/ingestion.py` | Coordinates S3 reads, database inserts, retries, and continuation messages |
-| `pipeline/matching.py` | Sends the completed-job payload to n8n |
-| `database/models.py` | Defines jobs, users, chunks, errors, and webhook deliveries |
-| `tests/test_csv_ingestion.py` | Tests CSV reading and validation behavior |
-| `tests/test_pipeline_messages.py` | Tests S3/SQS message parsing |
-
-## 9. Prototype notes
-
-The current API endpoint does not have an authorizer configured. In this
-prototype, anyone who can call the endpoint may be able to request an upload
-URL. Before production use, the endpoint should be protected by the
-application's authentication and authorization system.
-
-The AWS resources are configured for the `ap-southeast-2` region in
-`serverless.yml`. The AWS CLI default region does not control this Serverless
-deployment.
+|---|---|
+| `serverless.yml` | AWS functions, queues, bucket, permissions, and deployment settings. |
+| `pipeline/upload.py` | Creates an ingestion job and a direct S3 upload URL. |
+| `pipeline/csv_ingestion.py` | Reads CSV chunks and performs minimal validation. |
+| `pipeline/ingestion.py` | Coordinates S3 reads, database inserts, continuation messages, and matching delivery creation. |
+| `pipeline/matching.py` | Starts Workflow B only and records the delivery result. |
+| `database/models.py` | Defines the PostgreSQL models and constraints. |
+| `database/session.py` | Provides shared SQLAlchemy connections and transactions. |
+| `alembic/versions/` | Contains database migrations. |
+| `frontend/` | Contains the browser upload page. |
+| `tests/` | Contains offline tests for the Python pipeline. |

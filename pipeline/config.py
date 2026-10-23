@@ -40,7 +40,6 @@ class PipelineSettings:
     ingestion_queue_url: str
     matching_queue_url: str
     n8n_webhook_url: str | None
-    workflow_c_webhook_url: str | None
     presigned_url_expires_seconds: int = 900
     ingestion_batch_rows: int = 1000
     webhook_timeout_seconds: int = 10
@@ -54,7 +53,6 @@ def get_pipeline_settings() -> PipelineSettings:
         ingestion_queue_url=_required("INGESTION_QUEUE_URL"),
         matching_queue_url=_required("MATCHING_QUEUE_URL"),
         n8n_webhook_url=_optional("N8N_WEBHOOK_URL"),
-        workflow_c_webhook_url=_optional("N8N_WORKFLOW_C_WEBHOOK_URL"),
         presigned_url_expires_seconds=_positive_int(
             "PRESIGNED_URL_EXPIRES_SECONDS", 900
         ),

@@ -1,4 +1,4 @@
-"""Send one completion notification to n8n."""
+"""Send the ingestion-complete event to the n8n matching workflow."""
 
 from __future__ import annotations
 
@@ -43,7 +43,11 @@ def handle_matching(
 
 
 def process_delivery(delivery_id: UUID) -> None:
-    """Load a saved payload, call n8n, and update the delivery status."""
+    """Load a saved payload, call Workflow B, and update delivery status.
+
+    Workflow B owns the handoff to Workflow C inside n8n. This Lambda only
+    starts Workflow B and records whether that handoff was accepted.
+    """
 
     settings = get_pipeline_settings()
     now = datetime.now(timezone.utc)
@@ -78,8 +82,9 @@ def process_delivery(delivery_id: UUID) -> None:
         _fail_delivery(delivery_id, "N8N_WEBHOOK_URL is not configured", None)
         raise RuntimeError("N8N_WEBHOOK_URL is not configured")
 
-    # Workflow B must be configured to respond after its last node finishes.
-    # Only then do we start Workflow C for email notifications.
+    # Workflow B owns the later Workflow C handoff inside n8n. Workflow B must
+    # place that handoff after its final matching path, while this Lambda only
+    # waits for Workflow B's HTTP response.
     status_code = _post_webhook(
         delivery_id,
         settings.n8n_webhook_url,
@@ -87,24 +92,8 @@ def process_delivery(delivery_id: UUID) -> None:
         settings.webhook_timeout_seconds,
     )
 
-    if not settings.workflow_c_webhook_url:
-        _fail_delivery(
-            delivery_id,
-            "N8N_WORKFLOW_C_WEBHOOK_URL is not configured",
-            None,
-        )
-        raise RuntimeError("N8N_WORKFLOW_C_WEBHOOK_URL is not configured")
-
-    # Workflow C receives the same small payload, only after Workflow B has
-    # returned a successful response.
-    status_code = _post_webhook(
-        delivery_id,
-        settings.workflow_c_webhook_url,
-        payload,
-        settings.webhook_timeout_seconds,
-    )
-
-    # Only mark the delivery sent after n8n has returned a successful status.
+    # Mark the delivery sent after Workflow B accepts the event. Workflow C is
+    # started and monitored by n8n, not by this Lambda.
     with session_scope() as session:
         delivery = session.scalar(
             select(WebhookDelivery)
